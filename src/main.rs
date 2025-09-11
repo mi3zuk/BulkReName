@@ -1,24 +1,5 @@
-// main.rs
-// File Renamer GUI using eframe (egui) + rfd for file dialog.
-// - Template blocks: Literal, Number, Date, Original
-// - Number block: width, start, step. When value exceeds width, prints full number (no truncation).
-// - Collision strategies: Overwrite, Skip, Suffix ("(1)")
-// - Preserves file extension
-// - Persist rename‐template across restarts
-//
-// NOTE: Add these dependencies to Cargo.toml before building:
-//
-// [dependencies]
-// eframe = "0.25"
-// rfd = "0.10"
-// chrono = "0.4"
-// image = { version = "0.24", features = ["png","jpeg","webp","gif","bmp","ico"] }
-// serde = { version = "1.0", features = ["derive"] }
-// serde_json = "1.0"
-// directories = "5.0"
-//
-// Build & run:
-// cargo run --release
+// BulkReName GUI using eframe (egui) + rfd for file dialog.
+
 #![windows_subsystem = "windows"]
 
 use chrono::{DateTime, Local};
@@ -100,7 +81,7 @@ impl Default for RenamerApp {
 impl RenamerApp {
     /// Path to `templates.json` in user config directory.
     fn config_path() -> PathBuf {
-        let proj = ProjectDirs::from("jp", "MyCompany", "ReNameALGO")
+        let proj = ProjectDirs::from("jp", "mi3zuk", "BulkReName")
             .expect("failed to get project directory");
         let dir = proj.config_dir();
         let _ = fs::create_dir_all(dir);
@@ -397,7 +378,7 @@ fn append_suffix_before_ext(p: &PathBuf, suffix: &str) -> PathBuf {
 impl eframe::App for RenamerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("File Renamer (Rust + egui)");
+            ui.heading("BulkReName");
 
             // top buttons
             ui.horizontal(|ui| {
@@ -412,7 +393,7 @@ impl eframe::App for RenamerApp {
                     self.files.clear();
                     self.selected_idx = None;
                 }
-                if ui.button("Execute Rename").clicked() {
+                if ui.button("ReName").clicked() {
                     self.execute_rename();
                 }
                 if ui.button("Undo").clicked() {
@@ -676,7 +657,7 @@ impl eframe::App for RenamerApp {
 fn main() {
     let options = eframe::NativeOptions::default();
     let result = eframe::run_native(
-        "ReNameAlgorithm",
+        "BulkReName",
         options,
         Box::new(|cc| {
             // Optional: embed Japanese font
