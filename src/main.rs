@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use eframe::egui::ViewportBuilder;
+use image::GenericImageView;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum Block {
@@ -54,6 +56,9 @@ struct RenamerApp {
     // persistence
     saved_templates: Vec<Template>,
     current_template_name: String,
+    //loading
+    is_loading: bool,
+    pending_files: Option<Vec<PathBuf>>,
 }
 
 impl Default for RenamerApp {
@@ -74,6 +79,9 @@ impl Default for RenamerApp {
             thumb_max_size: (160, 120),
             saved_templates: Vec::new(),
             current_template_name: String::new(),
+            //loading
+            is_loading: false,
+            pending_files: None,
         }
     }
 }
@@ -377,17 +385,32 @@ fn append_suffix_before_ext(p: &PathBuf, suffix: &str) -> PathBuf {
 
 impl eframe::App for RenamerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(paths) = self.pending_files.take() {
+            for p in paths {
+                self.add_files(vec![p]);
+            }
+            self.is_loading = false;
+        }
+        
+        if self.is_loading {
+            egui::Window::new("Loading...").show(ctx, |ui| {
+                ui.spinner();
+                ui.label("Loading...");
+            });
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("BulkReName");
 
             // top buttons
             ui.horizontal(|ui| {
                 if ui.button("Add files...").clicked() {
-                    if let Some(paths) =
-                        rfd::FileDialog::new().set_title("Select files").pick_files()
-                    {
-                        self.add_files(paths);
+                    if let Some(paths) = rfd::FileDialog::new().pick_files() {
+                        self.is_loading = true;
+                        self.pending_files = Some(paths);
+                        ctx.request_repaint();
                     }
+                    //rfd::FileDialog::new().set_title("Select files").pick_files(){self.add_files(paths);}
                 }
                 if ui.button("Clear files").clicked() {
                     self.files.clear();
@@ -408,10 +431,12 @@ impl eframe::App for RenamerApp {
                 let left = &mut cols[0];
                 left.label(RichText::new("Files (select then move)").strong());
                 egui::ScrollArea::vertical()
-                    .max_height(400.0)
+                    .max_height(800.0)
                     .auto_shrink([false, false])
                     .id_source("file_list")
                     .show(left, |ui| {
+                        let mut to_delete = None;
+
                         for i in 0..self.files.len() {
                             let full = self.files[i]
                                 .path
@@ -435,8 +460,10 @@ impl eframe::App for RenamerApp {
                                         self.move_down();
                                     }
                                     if ui.small_button("Del").clicked() {
+                                        to_delete = Some(i);
+                                    }
+                                    if let Some(i) = to_delete {
                                         self.selected_idx = Some(i);
-                                        self.remove_selected();
                                     }
                                 });
 
@@ -458,6 +485,10 @@ impl eframe::App for RenamerApp {
                                 let resp = ui.selectable_label(selected, disp);
                                 resp.on_hover_text(full);
                             });
+                        }
+                        if let Some(i) = to_delete {
+                            self.selected_idx = Some(i);
+                            self.remove_selected();
                         }
                     });
 
@@ -655,7 +686,21 @@ impl eframe::App for RenamerApp {
 }
 
 fn main() {
-    let options = eframe::NativeOptions::default();
+    let bytes = include_bytes!("../BulkReName.png");
+    let img = image::load_from_memory(bytes).expect("Failed to load icon");
+    let (w, h) = img.dimensions();
+    let rgba = img.to_rgba8().into_raw();
+    let viewport = ViewportBuilder::default()
+        .with_inner_size([1000.0, 800.0])
+        .with_icon(egui::IconData {
+            rgba,
+            width: w,
+            height: h,
+        });
+    let options = eframe::NativeOptions {
+        viewport,
+        ..Default::default()
+    };
     let result = eframe::run_native(
         "BulkReName",
         options,

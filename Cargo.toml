@@ -4,9 +4,14 @@ name    = "BulkReName"
 version = "0.1.0"
 edition = "2021"
 include = ["main.rs", "NotoSansJP-Regular.ttf"]
+build = "build.rs"
+
+[build-dependencies]
+winres = "0.1"
 
 [dependencies]
-eframe = "0.24"
+eframe = "0.27"
+egui   = "0.27"
 rfd    = "0.9"
 chrono = "0.4"
 winapi = { version = "0.3", features = ["winuser", "windef"] }
