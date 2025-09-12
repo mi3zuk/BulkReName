@@ -1,6 +1,10 @@
 # BulkReName
 
-自前でビルドする場合、リポジトリのルートにNotoSansJP-Regular.ttfを置いてください
+<img src="BulkReName.png" width="40%">
+
+ファイル名を一括変更します
+
+※自前でビルドする場合、リポジトリのルートにNotoSansJP-Regular.ttfを置いてください
 
 ## 機能
 - `Literal` : 任意の文字列
