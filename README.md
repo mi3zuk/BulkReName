@@ -32,6 +32,11 @@
 
 - `Orig. Name`：元のファイル名
 
+- Save/Load Template
+  テンプレートを呼び出す機能
+  保存したテンプレートを消す機能を付け忘れた
+  追々付ける
+
 ## 備考
 サポートされている形式
 "png", "jpg", "jpeg", "webp", "gif", "bmp", "ico"
