@@ -1,10 +1,6 @@
 # BulkReName
-
-<img src="BulkReName.png" width="40%">
-
-ファイル名を一括変更します
-
-※自前でビルドする場合、リポジトリのルートにNotoSansJP-Regular.ttfを置いてください
+<img src="BulkReName.png" width="10%">
+ファイル名を一括変更
 
 ## 機能
 - `Literal` : 任意の文字列
@@ -39,8 +35,6 @@
 
 - Save/Load Template
   テンプレートを呼び出す機能
-  保存したテンプレートを消す機能を付け忘れた
-  追々付ける
 
 ## 備考
 サポートされている形式
