@@ -5,7 +5,7 @@
 use chrono::{DateTime, Local};
 use directories::ProjectDirs;
 use eframe::{egui, egui::RichText};
-use egui::{ComboBox, DragValue};
+use egui::{ComboBox, DragValue, Layout};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use eframe::egui::ViewportBuilder;
 use image::GenericImageView;
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::thread;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum Block {
@@ -20,6 +22,7 @@ enum Block {
     Number { width: usize, start: i64, step: i64 },
     Date { format: String },
     Original,
+    Extension,
 }
 
 #[derive(Clone)]
@@ -42,6 +45,19 @@ struct Template {
     use_mtime_for_date: bool,
 }
 
+enum ThumbnailState {
+    Loading,
+    Loaded(egui::TextureHandle, egui::Vec2),
+    Failed,
+}
+
+#[derive(PartialEq)]
+enum LoadingPhase {
+    None,
+    AddingFiles,
+    LoadingThumbs,
+}
+
 struct RenamerApp {
     files: Vec<FileEntry>,
     selected_idx: Option<usize>,
@@ -50,15 +66,18 @@ struct RenamerApp {
     use_mtime_for_date: bool,
     last_actions: Vec<HashMap<PathBuf, PathBuf>>,
     messages: Vec<String>,
-    // thumbnail cache: key = path → (texture, original size)
-    thumbnails: HashMap<String, (egui::TextureHandle, egui::Vec2)>,
+    // thumbnail cache: key = path → state
+    thumbnails: HashMap<String, ThumbnailState>,
     thumb_max_size: (usize, usize),
+    thumb_tx: Option<SyncSender<(String, Result<(image::RgbaImage, (usize, usize)), String>)>>,
+    thumb_rx: Option<Receiver<(String, Result<(image::RgbaImage, (usize, usize)), String>)>>,
     // persistence
     saved_templates: Vec<Template>,
     current_template_name: String,
     //loading
-    is_loading: bool,
-    pending_files: Option<Vec<PathBuf>>,
+    loading_phase: LoadingPhase,
+    loader_rx: Option<Receiver<PathBuf>>,
+    loading_count: usize,
 }
 
 impl Default for RenamerApp {
@@ -67,9 +86,8 @@ impl Default for RenamerApp {
             files: Vec::new(),
             selected_idx: None,
             blocks: vec![
-                Block::Number { width: 4, start: 1, step: 1 },
-                Block::Literal("_".into()),
                 Block::Original,
+                Block::Extension,
             ],
             collision: CollisionStrategy::Suffix,
             use_mtime_for_date: true,
@@ -77,11 +95,14 @@ impl Default for RenamerApp {
             messages: Vec::new(),
             thumbnails: HashMap::new(),
             thumb_max_size: (160, 120),
+            thumb_tx: None,
+            thumb_rx: None,
             saved_templates: Vec::new(),
             current_template_name: String::new(),
             //loading
-            is_loading: false,
-            pending_files: None,
+            loading_phase: LoadingPhase::None,
+            loader_rx: None,
+            loading_count: 0,
         }
     }
 }
@@ -114,6 +135,21 @@ impl RenamerApp {
         for p in paths {
             if p.is_file() {
                 self.files.push(FileEntry { path: p });
+            }
+        }
+    }
+
+
+
+    fn collect_files_recursively(dir: &Path, out: &mut Vec<PathBuf>) {
+        if let Ok(read_dir) = fs::read_dir(dir) {
+            for entry in read_dir.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    out.push(path);
+                } else if path.is_dir() {
+                    Self::collect_files_recursively(&path, out);
+                }
             }
         }
     }
@@ -170,7 +206,8 @@ impl RenamerApp {
                 .path
                 .extension()
                 .and_then(|s| s.to_str())
-                .map(|s| s.to_string());
+                .unwrap_or("")
+                .to_string();
 
             let now: DateTime<Local> = Local::now();
             let mut parts = Vec::new();
@@ -180,16 +217,22 @@ impl RenamerApp {
                     Block::Number { width, start, step } => {
                         parts.push(self.format_number(idx, *width, *start, *step))
                     }
-                    Block::Date { format } => parts.push(now.format(format).to_string()),
+                    Block::Date { format } => {
+                        let s = std::panic::catch_unwind(|| {
+                            now.format(format).to_string()
+                        })
+                        .unwrap_or_else(|_| "[INVALID_DATE]".to_string());
+                        parts.push(s);
+                    }
                     Block::Original => parts.push(file_name.clone()),
+                    Block::Extension => {
+                        if !ext.is_empty() {
+                            parts.push(format!(".{}", ext));
+                        }
+                    }
                 }
             }
-            let mut base = parts.join("");
-            if let Some(e) = ext {
-                base.push('.');
-                base.push_str(&e);
-            }
-            res.push(base);
+            res.push(parts.join(""));
         }
         res
     }
@@ -212,7 +255,7 @@ impl RenamerApp {
             .collect()
     }
 
-    fn ensure_thumbnail(&mut self, ctx: &egui::Context, path: &Path) {
+    fn ensure_thumbnail(&mut self, _ctx: &egui::Context, path: &Path) {
         let key = path.to_string_lossy().to_string();
         if self.thumbnails.contains_key(&key) {
             return;
@@ -225,18 +268,33 @@ impl RenamerApp {
         } else {
             return;
         }
-        if let Ok(img) = image::open(path) {
-            let (max_w, max_h) = self.thumb_max_size;
-            let thumb = img.thumbnail(max_w as u32, max_h as u32).into_rgba8();
-            let (w, h) = (thumb.width() as usize, thumb.height() as usize);
-            let pixels = thumb.into_vec();
-            let color_image = egui::ColorImage::from_rgba_unmultiplied([w, h], &pixels);
-            let tex = ctx.load_texture(key.clone(), color_image, egui::TextureOptions::NEAREST);
-            let orig_size = egui::Vec2::new(w as f32, h as f32);
-            self.thumbnails.insert(key, (tex, orig_size));
-        } else if let Err(e) = image::open(path) {
-            self.messages
-                .push(format!("thumbnail load failed for {:?}: {}", path, e));
+        self.thumbnails.insert(key.clone(), ThumbnailState::Loading);
+
+        // Initialize channel if not already done
+        if self.thumb_tx.is_none() {
+            let (tx, rx) = mpsc::sync_channel(4); // Limit to 4 concurrent thumbnail threads
+            self.thumb_tx = Some(tx);
+            self.thumb_rx = Some(rx);
+        }
+
+        let path_clone = path.to_path_buf();
+        let max_size = self.thumb_max_size;
+        if let Some(tx) = &self.thumb_tx {
+            let tx_clone = tx.clone();
+            thread::spawn(move || {
+                let result = std::panic::catch_unwind(|| {
+                    match image::open(&path_clone) {
+                        Ok(img) => {
+                            let (max_w, max_h) = max_size;
+                            let thumb = img.thumbnail(max_w as u32, max_h as u32).into_rgba8();
+                            let (w, h) = (thumb.width() as usize, thumb.height() as usize);
+                            Ok((thumb, (w, h)))
+                        }
+                        Err(e) => Err(format!("{:?}", e)),
+                    }
+                }).unwrap_or_else(|_| Err("Panic in image processing".to_string()));
+                tx_clone.send((key, result)).ok();
+            });
         }
     }
 
@@ -385,18 +443,118 @@ fn append_suffix_before_ext(p: &PathBuf, suffix: &str) -> PathBuf {
 
 impl eframe::App for RenamerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if let Some(paths) = self.pending_files.take() {
-            for p in paths {
-                self.add_files(vec![p]);
+        // Process thumbnail loading results
+        if let Some(rx) = &self.thumb_rx {
+            while let Ok((key, result)) = rx.try_recv() {
+                match result {
+                    Ok((rgba, (w, h))) => {
+                        let color_image = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba.into_vec());
+                        let tex = ctx.load_texture(key.clone(), color_image, egui::TextureOptions::NEAREST);
+                        let orig_size = egui::Vec2::new(w as f32, h as f32);
+                        self.thumbnails.insert(key, ThumbnailState::Loaded(tex, orig_size));
+                    }
+                    Err(e) => {
+                        self.thumbnails.insert(key, ThumbnailState::Failed);
+                        self.messages.push(format!("Thumbnail load failed: {}", e));
+                    }
+                }
             }
-            self.is_loading = false;
         }
-        
-        if self.is_loading {
-            egui::Window::new("Loading...").show(ctx, |ui| {
-                ui.spinner();
-                ui.label("Loading...");
+
+        match self.loading_phase {
+            LoadingPhase::AddingFiles => {
+                if self.loading_phase == LoadingPhase::AddingFiles {
+                    let mut finished = false;
+                    if let Some(rx) = self.loader_rx.take() {
+                        use std::sync::mpsc::TryRecvError;
+                        loop {
+                            match rx.try_recv() {
+                                Ok(path) => {
+                                    self.add_files(vec![path]);
+                                    self.loading_count += 1;
+                                }
+                                Err(TryRecvError::Empty) => {
+                                    self.loader_rx = Some(rx);
+                                    break;
+                                }
+                                Err(TryRecvError::Disconnected) => {
+                                    finished = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if finished {
+                        self.loading_phase = LoadingPhase::LoadingThumbs;
+                        self.loading_count = 0;
+                    }
+                    ctx.request_repaint();
+                }
+                   
+            }
+            LoadingPhase::LoadingThumbs => {
+                // Check if any thumbnails are still loading
+                let any_loading = self.thumbnails.values().any(|s| matches!(s, ThumbnailState::Loading));
+                if !any_loading {
+                    self.loading_phase = LoadingPhase::None;
+                }
+                ctx.request_repaint();
+            }
+            LoadingPhase::None => {}
+        }
+
+        let dropped = ctx.input_mut(|i| {
+            if i.raw.dropped_files.is_empty() {
+                None
+            } else {
+                Some(std::mem::take(&mut i.raw.dropped_files))
+            }
+        });
+
+        if let Some(dropped_files) = dropped {
+            let (tx, rx) = mpsc::channel::<PathBuf>();
+            self.loader_rx = Some(rx);
+            self.loading_phase = LoadingPhase::AddingFiles;
+            thread::spawn(move || {
+                let mut collected = Vec::new();
+                for f in dropped_files {
+                    if let Some(path) = f.path {
+                        if path.is_file() {
+                            collected.push(path);
+                        } else if path.is_dir() {
+                            Self::collect_files_recursively(&path, &mut collected);
+                        }
+                    }
+                }
+                for path in collected {
+                    tx.send(path).ok();
+                }
             });
+            ctx.request_repaint();
+        }
+
+        if self.loading_phase == LoadingPhase::None
+            && ctx.input(|i| !i.raw.hovered_files.is_empty())
+        {
+            egui::Area::new("drop_overlay".into())
+                .order(egui::Order::Foreground)
+                .interactable(false)
+                .show(ctx, |ui| {
+                    let rect = ctx.available_rect();
+                    ui.painter().rect_filled(
+                        rect,
+                        0.0,
+                        egui::Color32::from_rgba_unmultiplied(50, 100, 200, 80),
+                    );
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            egui::RichText::new("Drop files to add")
+                                .size(32.0)
+                                .color(egui::Color32::WHITE),
+                        );
+                    });
+                }
+            );
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -406,11 +564,18 @@ impl eframe::App for RenamerApp {
             ui.horizontal(|ui| {
                 if ui.button("Add files...").clicked() {
                     if let Some(paths) = rfd::FileDialog::new().pick_files() {
-                        self.is_loading = true;
-                        self.pending_files = Some(paths);
-                        ctx.request_repaint();
+                        if !paths.is_empty() {
+                            let (tx, rx) = mpsc::channel::<PathBuf>();
+                            self.loader_rx = Some(rx);
+                            self.loading_phase = LoadingPhase::AddingFiles;
+                            thread::spawn(move || {
+                                for p in paths {
+                                    tx.send(p).ok();
+                                }
+                            });
+                            ctx.request_repaint();
+                        }
                     }
-                    //rfd::FileDialog::new().set_title("Select files").pick_files(){self.add_files(paths);}
                 }
                 if ui.button("Clear files").clicked() {
                     self.files.clear();
@@ -421,6 +586,22 @@ impl eframe::App for RenamerApp {
                 }
                 if ui.button("Undo").clicked() {
                     self.undo();
+                }
+                if self.loading_phase == LoadingPhase::AddingFiles {
+                    ui.separator();
+                    ui.spinner();
+                    ui.label(format!(
+                        "Loading files... ({})",
+                        self.loading_count
+                    ));
+                } else if self.loading_phase == LoadingPhase::LoadingThumbs {
+                    let loading_thumb_count = self.thumbnails.values().filter(|s| matches!(s, ThumbnailState::Loading)).count();
+                    ui.separator();
+                    ui.spinner();
+                    ui.label(format!(
+                        "Loading thumbnails... ({})",
+                        loading_thumb_count
+                    ));
                 }
             });
 
@@ -444,47 +625,71 @@ impl eframe::App for RenamerApp {
                                 .and_then(|s| s.to_str())
                                 .unwrap_or("")
                                 .to_string();
-                            let disp = if full.len() > 20 {
-                                format!("{}…{}", &full[..10], &full[full.len() - 9..])
-                            } else {
-                                full.clone()
+                            let disp = {
+                                let chars: Vec<char> = full.chars().collect();
+                                if chars.len() > 20 {
+                                    let first_10: String = chars[..10].iter().collect();
+                                    let last_9: String = chars[chars.len().saturating_sub(9)..].iter().collect();
+                                    format!("{}…{}", first_10, last_9)
+                                } else {
+                                    full.clone()
+                                }
                             };
                             ui.horizontal(|ui| {
-                                ui.vertical(|ui| {
-                                    if ui.small_button("▲").clicked() {
-                                        self.selected_idx = Some(i);
-                                        self.move_up();
-                                    }
-                                    if ui.small_button("▼").clicked() {
-                                        self.selected_idx = Some(i);
-                                        self.move_down();
-                                    }
-                                    if ui.small_button("Del").clicked() {
+                                ui.with_layout(Layout::left_to_right(egui::Align::TOP), |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.vertical(|ui| {
+                                            if ui.small_button("▲").clicked() {
+                                                self.selected_idx = Some(i);
+                                                self.move_up();
+                                            }
+                                            if ui.small_button("▼").clicked() {
+                                                self.selected_idx = Some(i);
+                                                self.move_down();
+                                            }
+                                        });
+
+                                        // thumbnail
+                                        let path_buf = self.files[i].path.clone();
+                                        let key = path_buf.to_string_lossy().to_string();
+                                        if !self.thumbnails.contains_key(&key) {
+                                            self.ensure_thumbnail(ctx, &path_buf);
+                                        }
+                                        match self.thumbnails.get(&key) {
+                                            Some(ThumbnailState::Loaded(tex, orig_size)) => {
+                                                let max_w = self.thumb_max_size.0 as f32;
+                                                let max_h = self.thumb_max_size.1 as f32;
+                                                let scale = (max_w / orig_size.x)
+                                                    .min(max_h / orig_size.y)
+                                                    .min(1.0);
+                                                let size = *orig_size * scale;
+                                                ui.image((tex.id(), size));
+                                            }
+                                            Some(ThumbnailState::Loading) => {
+                                                ui.spinner();
+                                            }
+                                            _ => {}
+                                        }
+
+                                        let selected = Some(i) == self.selected_idx;
+                                        let resp = ui.selectable_label(selected, disp);
+                                        resp.on_hover_text(full);
+                                    });
+                                });
+
+                                ui.with_layout(Layout::right_to_left(egui::Align::TOP), |ui| {
+                                    ui.add_space(10.0);
+                                    let del_btn = egui::Button::new("Del")
+                                        .fill(egui::Color32::from_rgb(240, 150, 150));
+
+                                    if ui.add(del_btn).clicked() {
                                         to_delete = Some(i);
-                                    }
-                                    if let Some(i) = to_delete {
                                         self.selected_idx = Some(i);
                                     }
                                 });
-
-                                // thumbnail
-                                let path_buf = self.files[i].path.clone();
-                                self.ensure_thumbnail(ctx, &path_buf);
-                                let key = path_buf.to_string_lossy().to_string();
-                                if let Some((tex, orig_size)) = self.thumbnails.get(&key) {
-                                    let max_w = self.thumb_max_size.0 as f32;
-                                    let max_h = self.thumb_max_size.1 as f32;
-                                    let scale = (max_w / orig_size.x)
-                                        .min(max_h / orig_size.y)
-                                        .min(1.0);
-                                    let size = *orig_size * scale;
-                                    ui.image((tex.id(), size));
-                                }
-
-                                let selected = Some(i) == self.selected_idx;
-                                let resp = ui.selectable_label(selected, disp);
-                                resp.on_hover_text(full);
                             });
+
+                            ui.separator();
                         }
                         if let Some(i) = to_delete {
                             self.selected_idx = Some(i);
@@ -530,6 +735,9 @@ impl eframe::App for RenamerApp {
                             }
                             Block::Original => {
                                 ui.label("<Orig. Name>");
+                            }
+                            Block::Extension => {
+                                ui.label("<Extension>");
                             }
                         }
                         if ui.small_button("Del").clicked() {
@@ -578,6 +786,9 @@ impl eframe::App for RenamerApp {
                     if ui.button("Add Original").clicked() {
                         self.blocks.push(Block::Original);
                     }
+                    if ui.button("Add Extension").clicked() {
+                        self.blocks.push(Block::Extension);
+                    }
                 });
                 right.separator();
 
@@ -598,10 +809,15 @@ impl eframe::App for RenamerApp {
                     .show(right, |ui| {
                         let w = ui.available_width();
                         for (old, new_name) in self.preview_table().iter() {
-                            let txt = if old.len() > 20 {
-                                format!("{}…{}", &old[..10], &old[old.len() - 9..])
-                            } else {
-                                old.clone()
+                            let txt = {
+                                let chars: Vec<char> = old.chars().collect();
+                                if chars.len() > 20 {
+                                    let first_10: String = chars[..10].iter().collect();
+                                    let last_9: String = chars[chars.len().saturating_sub(9)..].iter().collect();
+                                    format!("{}…{}", first_10, last_9)
+                                } else {
+                                    old.clone()
+                                }
                             };
                             let lbl = ui.label(txt);
                             lbl.on_hover_text(old);
@@ -670,6 +886,18 @@ impl eframe::App for RenamerApp {
                             self.use_mtime_for_date = tpl.use_mtime_for_date;
                         }
                     }
+                    if ui.button("Delete").clicked() {
+                        if let Some(pos) = self
+                            .saved_templates
+                            .iter()
+                            .position(|t| t.name == self.current_template_name)
+                        {
+                            self.saved_templates.remove(pos);
+                            self.current_template_name.clear();
+                            self.save_templates();
+                            self.messages.push("Template deleted.".into());
+                        }
+                    }
                 });
             });
 
@@ -682,6 +910,10 @@ impl eframe::App for RenamerApp {
                     }
                 });
         });
+
+        if self.loading_phase == LoadingPhase::AddingFiles || self.loading_phase == LoadingPhase::LoadingThumbs {
+            ctx.request_repaint();
+        }
     }
 }
 
@@ -696,7 +928,8 @@ fn main() {
             rgba,
             width: w,
             height: h,
-        });
+        })
+        .with_min_inner_size(egui::Vec2::new(300.0, 250.0));
     let options = eframe::NativeOptions {
         viewport,
         ..Default::default()
