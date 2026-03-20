@@ -58,20 +58,6 @@ enum LoadingPhase {
     LoadingThumbs,
 }
 
-//sort用
-#[derive(PartialEq, Copy, Clone)]
-enum SortKey {
-    Name,
-    Modified,
-    Created,
-    Size,
-}
-#[derive(PartialEq, Copy, Clone)]
-enum SortOrder {
-    Asc,
-    Desc,
-}
-
 struct RenamerApp {
     files: Vec<FileEntry>,
     selected_idx: Option<usize>,
@@ -85,7 +71,6 @@ struct RenamerApp {
     thumb_max_size: (usize, usize),
     thumb_tx: Option<SyncSender<(String, Result<(image::RgbaImage, (usize, usize)), String>)>>,
     thumb_rx: Option<Receiver<(String, Result<(image::RgbaImage, (usize, usize)), String>)>>,
-    show_thumbnails: bool,
     // persistence
     saved_templates: Vec<Template>,
     current_template_name: String,
@@ -93,9 +78,6 @@ struct RenamerApp {
     loading_phase: LoadingPhase,
     loader_rx: Option<Receiver<PathBuf>>,
     loading_count: usize,
-    //sort
-    sort_key: Option<SortKey>,
-    sort_order: SortOrder,
 }
 
 impl Default for RenamerApp {
@@ -115,16 +97,12 @@ impl Default for RenamerApp {
             thumb_max_size: (160, 120),
             thumb_tx: None,
             thumb_rx: None,
-            show_thumbnails: true,
             saved_templates: Vec::new(),
             current_template_name: String::new(),
             //loading
             loading_phase: LoadingPhase::None,
             loader_rx: None,
             loading_count: 0,
-            //sort
-            sort_key: None,
-            sort_order: SortOrder::Asc,
         }
     }
 }
@@ -157,52 +135,6 @@ impl RenamerApp {
         for p in paths {
             if p.is_file() {
                 self.files.push(FileEntry { path: p });
-            }
-        }
-    }
-
-    fn sort_files(&mut self, key: SortKey) {
-        // トグル判定
-        if self.sort_key == Some(key) {
-            self.sort_order = match self.sort_order {
-                SortOrder::Asc => SortOrder::Desc,
-                SortOrder::Desc => SortOrder::Asc,
-            };
-        } else {
-            self.sort_key = Some(key);
-            self.sort_order = SortOrder::Asc;
-        }
-        let asc = self.sort_order == SortOrder::Asc;
-        match key {
-            SortKey::Name => {
-                self.files.sort_by(|a, b| {
-                    let ord = a.path.file_name().cmp(&b.path.file_name());
-                    if asc { ord } else { ord.reverse() }
-                });
-            }
-            SortKey::Modified => {
-                self.files.sort_by(|a, b| {
-                    let a_m = fs::metadata(&a.path).and_then(|m| m.modified()).ok();
-                    let b_m = fs::metadata(&b.path).and_then(|m| m.modified()).ok();
-                    let ord = a_m.cmp(&b_m);
-                    if asc { ord } else { ord.reverse() }
-                });
-            }
-            SortKey::Created => {
-                self.files.sort_by(|a, b| {
-                    let a_c = fs::metadata(&a.path).and_then(|m| m.created()).ok();
-                    let b_c = fs::metadata(&b.path).and_then(|m| m.created()).ok();
-                    let ord = a_c.cmp(&b_c);
-                    if asc { ord } else { ord.reverse() }
-                });
-            }
-            SortKey::Size => {
-                self.files.sort_by(|a, b| {
-                    let a_s = fs::metadata(&a.path).map(|m| m.len()).ok();
-                    let b_s = fs::metadata(&b.path).map(|m| m.len()).ok();
-                    let ord = a_s.cmp(&b_s);
-                    if asc { ord } else { ord.reverse() }
-                });
             }
         }
     }
@@ -632,7 +564,17 @@ impl eframe::App for RenamerApp {
             ui.horizontal(|ui| {
                 if ui.button("Add files...").clicked() {
                     if let Some(paths) = rfd::FileDialog::new().pick_files() {
-                        self.add_files(paths);
+                        if !paths.is_empty() {
+                            let (tx, rx) = mpsc::channel::<PathBuf>();
+                            self.loader_rx = Some(rx);
+                            self.loading_phase = LoadingPhase::AddingFiles;
+                            thread::spawn(move || {
+                                for p in paths {
+                                    tx.send(p).ok();
+                                }
+                            });
+                            ctx.request_repaint();
+                        }
                     }
                 }
                 if ui.button("Clear files").clicked() {
@@ -645,43 +587,21 @@ impl eframe::App for RenamerApp {
                 if ui.button("Undo").clicked() {
                     self.undo();
                 }
-            });
-
-            ui.separator();
-
-            ui.horizontal(|ui| {
-                ui.label("Sort: ");
-                let namelabel = match (self.sort_key, self.sort_order) {
-                    (Some(SortKey::Name), SortOrder::Asc) => "Name ↓",
-                    (Some(SortKey::Name), SortOrder::Desc) => "Name ↑",
-                    _ => "Name",
-                };
-                let modifiedlabel = match (self.sort_key, self.sort_order) {
-                    (Some(SortKey::Modified), SortOrder::Asc) => "Modified ↓",
-                    (Some(SortKey::Modified), SortOrder::Desc) => "Modified ↑",
-                    _ => "Modified",
-                };
-                let createdlabel = match (self.sort_key, self.sort_order) {
-                    (Some(SortKey::Created), SortOrder::Asc) => "Created ↓",
-                    (Some(SortKey::Created), SortOrder::Desc) => "Created ↑",
-                    _ => "Created",
-                };
-                let sizelabel = match (self.sort_key, self.sort_order) {
-                    (Some(SortKey::Size), SortOrder::Asc) => "Size ↓",
-                    (Some(SortKey::Size), SortOrder::Desc) => "Size ↑",
-                    _ => "Size",
-                };
-                if ui.button(namelabel).clicked() {
-                    self.sort_files(SortKey::Name);
-                }
-                if ui.button(modifiedlabel).clicked() {
-                    self.sort_files(SortKey::Modified);
-                }
-                if ui.button(createdlabel).clicked() {
-                    self.sort_files(SortKey::Created);
-                }
-                if ui.button(sizelabel).clicked() {
-                    self.sort_files(SortKey::Size);
+                if self.loading_phase == LoadingPhase::AddingFiles {
+                    ui.separator();
+                    ui.spinner();
+                    ui.label(format!(
+                        "Loading files... ({})",
+                        self.loading_count
+                    ));
+                } else if self.loading_phase == LoadingPhase::LoadingThumbs {
+                    let loading_thumb_count = self.thumbnails.values().filter(|s| matches!(s, ThumbnailState::Loading)).count();
+                    ui.separator();
+                    ui.spinner();
+                    ui.label(format!(
+                        "Loading thumbnails... ({})",
+                        loading_thumb_count
+                    ));
                 }
             });
 
@@ -691,7 +611,6 @@ impl eframe::App for RenamerApp {
                 // Left panel: file list
                 let left = &mut cols[0];
                 left.label(RichText::new("Files (select then move)").strong());
-                left.checkbox(&mut self.show_thumbnails, "show thumbnail");
                 egui::ScrollArea::vertical()
                     .max_height(800.0)
                     .auto_shrink([false, false])
@@ -731,27 +650,25 @@ impl eframe::App for RenamerApp {
                                         });
 
                                         // thumbnail
-                                        if self.show_thumbnails {
-                                            let path_buf = self.files[i].path.clone();
-                                            let key = path_buf.to_string_lossy().to_string();
-                                            if !self.thumbnails.contains_key(&key) {
-                                                self.ensure_thumbnail(ctx, &path_buf);
+                                        let path_buf = self.files[i].path.clone();
+                                        let key = path_buf.to_string_lossy().to_string();
+                                        if !self.thumbnails.contains_key(&key) {
+                                            self.ensure_thumbnail(ctx, &path_buf);
+                                        }
+                                        match self.thumbnails.get(&key) {
+                                            Some(ThumbnailState::Loaded(tex, orig_size)) => {
+                                                let max_w = self.thumb_max_size.0 as f32;
+                                                let max_h = self.thumb_max_size.1 as f32;
+                                                let scale = (max_w / orig_size.x)
+                                                    .min(max_h / orig_size.y)
+                                                    .min(1.0);
+                                                let size = *orig_size * scale;
+                                                ui.image((tex.id(), size));
                                             }
-                                            match self.thumbnails.get(&key) {
-                                                Some(ThumbnailState::Loaded(tex, orig_size)) => {
-                                                    let max_w = self.thumb_max_size.0 as f32;
-                                                    let max_h = self.thumb_max_size.1 as f32;
-                                                    let scale = (max_w / orig_size.x)
-                                                        .min(max_h / orig_size.y)
-                                                        .min(1.0);
-                                                    let size = *orig_size * scale;
-                                                    ui.image((tex.id(), size));
-                                                }
-                                                Some(ThumbnailState::Loading) => {
-                                                    ui.spinner();
-                                                }
-                                                _ => {}
-                                            }   
+                                            Some(ThumbnailState::Loading) => {
+                                                ui.spinner();
+                                            }
+                                            _ => {}
                                         }
 
                                         let selected = Some(i) == self.selected_idx;
@@ -779,7 +696,6 @@ impl eframe::App for RenamerApp {
                             self.remove_selected();
                         }
                     });
-
 
                 // Right panel: template, preview, persistence
                 let right = &mut cols[1];
@@ -887,7 +803,7 @@ impl eframe::App for RenamerApp {
                 right.separator();
                 right.label(RichText::new("Preview").strong());
                 egui::ScrollArea::vertical()
-                    .max_height(300.0)
+                    .max_height(200.0)
                     .auto_shrink([false, false])
                     .id_source("preview")
                     .show(right, |ui| {
