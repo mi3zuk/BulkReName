@@ -5,7 +5,7 @@
 use chrono::{DateTime, Local};
 use directories::ProjectDirs;
 use eframe::{egui, egui::RichText};
-use egui::{ComboBox, DragValue};//, Layout};
+use egui::{ComboBox, DragValue}; // ,Layout};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -784,112 +784,26 @@ impl eframe::App for BulkRename {
                     .show(left, |ui| {
                         let mut to_delete = None;
                         let pointer_y = ui.input(|i| i.pointer.hover_pos().map(|p| p.y));
-                        // rect
-                        let mut item_rects = Vec::new();
-                        for _ in 0..self.files.len() {
-                            let (rect, _) = ui.allocate_exact_size(
-                                egui::vec2(ui.available_width(), 60.0),
-                                egui::Sense::click_and_drag(),
-                            );
-                            item_rects.push(rect);
-                        }
-                        // Insertion position calculation
                         let mut insert_index = None;
-                        if let Some(py) = pointer_y {
-                            for (i, rect) in item_rects.iter().enumerate() {
-                                if py < rect.center().y {
-                                    insert_index = Some(i);
-                                    break;
-                                }
-                            }
-                            if insert_index.is_none() {
-                                insert_index = Some(self.files.len());
-                            }
-                        }
-                        // drow
+
+                        let mut row_tops = Vec::new();
+
                         for i in 0..self.files.len() {
-                            let rect = item_rects[i];
-                            let id = ui.id().with(i);
-                            let resp = ui.interact(rect, id, egui::Sense::click_and_drag());
-
-                            // start drag
-                            if resp.drag_started() {
-                                self.dragging_idx = Some(i);
-                                self.selected_idx = Some(i);
-                            }
-                            if resp.clicked() {
-                                self.selected_idx = Some(i);
-                            }
-
-                            // item background
-                            if Some(i) == self.dragging_idx {
-                                ui.painter().rect_filled(rect, 6.0, egui::Color32::DARK_GRAY);
-                            } else if Some(i) == self.selected_idx {
-                                ui.painter().rect_filled(rect, 6.0, egui::Color32::from_rgb(180, 180, 180));
-                            }
-                            if ui.input(|i| i.pointer.any_pressed()) && self.dragging_idx.is_none() {
-                                self.selected_idx = None;
-                            }
-
-                            // contents
-                            ui.allocate_ui_at_rect(rect, |ui| {
-                                ui.horizontal(|ui| {
-                                    // delete buttom
-                                    //ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                                        let del_btn = egui::Button::new("×")
-                                            .fill(egui::Color32::from_rgb(240, 120, 120));
-
-                                        if ui.add(del_btn).clicked() {
-                                            to_delete = Some(i);
-                                        }
-                                    //});
+                            let (rect, resp) = ui.push_id(i, |ui| {
+                                let content_ui = ui.horizontal(|ui| {
+                                    ui.set_min_height(40.0);
+                                    // delete
+                                    if ui.add(egui::Button::new("×").fill(egui::Color32::from_rgb(240, 120, 120))).clicked() {
+                                        to_delete = Some(i);
+                                    }
                                     ui.separator();
                                     // ▲▼
                                     ui.vertical(|ui| {
-                                        if ui.small_button("▲").clicked() {
-                                            self.selected_idx = Some(i);
-                                            self.move_up();
-                                        }
-                                        if ui.small_button("▼").clicked() {
-                                            self.selected_idx = Some(i);
-                                            self.move_down();
-                                        }
+                                        if ui.small_button("▲").clicked() { self.selected_idx = Some(i); self.move_up(); }
+                                        if ui.small_button("▼").clicked() { self.selected_idx = Some(i); self.move_down(); }
                                     });
-
-                                    // サムネ
-                                    if self.show_thumbnails {
-                                        let path_buf = self.files[i].path.clone();
-                                        let key = path_buf.to_string_lossy().to_string();
-
-                                        if !self.thumbnails.contains_key(&key) {
-                                            self.ensure_thumbnail(ui.ctx(), &path_buf);
-                                        }
-
-                                        match self.thumbnails.get(&key) {
-                                            Some(ThumbnailState::Loaded(tex, orig_size)) => {
-                                                let max_w = self.thumb_max_size.0 as f32;
-                                                let max_h = self.thumb_max_size.1 as f32;
-                                                let scale = (max_w / orig_size.x)
-                                                    .min(max_h / orig_size.y)
-                                                    .min(1.0);
-                                                let size = *orig_size * scale;
-                                                ui.image((tex.id(), size));
-                                            }
-                                            Some(ThumbnailState::Loading) => {
-                                                ui.spinner();
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-
                                     // file name
-                                    let full = self.files[i]
-                                        .path
-                                        .file_name()
-                                        .and_then(|s| s.to_str())
-                                        .unwrap_or("")
-                                        .to_string();
-
+                                    let full = self.files[i].path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
                                     let disp = {
                                         let chars: Vec<char> = full.chars().collect();
                                         if chars.len() > 20 {
@@ -900,21 +814,100 @@ impl eframe::App for BulkRename {
                                             full.clone()
                                         }
                                     };
-
                                     ui.label(disp).on_hover_text(full);
 
+                                    // thumbnail
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if self.show_thumbnails {
+                                            let path_buf = self.files[i].path.clone();
+                                            let key = path_buf.to_string_lossy().to_string();
+
+                                            if !self.thumbnails.contains_key(&key) {
+                                                self.ensure_thumbnail(ui.ctx(), &path_buf);
+                                            }
+
+                                            match self.thumbnails.get(&key) {
+                                                Some(ThumbnailState::Loaded(tex, orig_size)) => {
+                                                    let max_w = self.thumb_max_size.0 as f32;
+                                                    let max_h = self.thumb_max_size.1 as f32;
+                                                    let scale = (max_w / orig_size.x).min(max_h / orig_size.y).min(1.0);
+                                                    let size = *orig_size * scale;
+                                                    ui.image((tex.id(), size));
+                                                }
+                                                Some(ThumbnailState::Loading) => { ui.spinner(); }
+                                                _ => {}
+                                            }
+                                        }
+                                    });
                                 });
-                            });
-                            // sparator
-                            ui.painter().line_segment(
-                                [
-                                    egui::pos2(rect.left(), rect.bottom()),
-                                    egui::pos2(rect.right(), rect.bottom()),
-                                ],
-                                egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
-                            );
+
+                                let rect = content_ui.response.rect;
+
+                                let stroke = if Some(i) == self.dragging_idx {
+                                    Some(egui::Stroke::new(2.0, egui::Color32::WHITE))
+                                } else if Some(i) == self.selected_idx {
+                                    Some(egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 150, 250)))
+                                } else {
+                                    None
+                                };
+
+                                if let Some(s) = stroke {
+                                    ui.painter().rect_stroke(rect, 6.0, s);
+                                }
+
+                                // separator
+                                ui.painter().line_segment(
+                                    [rect.left_bottom(), rect.right_bottom()],
+                                    egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
+                                );
+
+                                let response = ui.interact(rect, ui.id(), egui::Sense::drag());
+
+                                (rect, response)
+                            }).inner;
+
+                            row_tops.push(rect.top());
+
+                            if resp.drag_started() {
+                                self.dragging_idx = Some(i);
+                                self.selected_idx = Some(i);
+                            }
+                            if !resp.dragged() && resp.clicked() {
+                                self.selected_idx = Some(i);
+                            }
+
+                            if let Some(py) = pointer_y {
+                                if py < rect.center().y && insert_index.is_none() {
+                                    insert_index = Some(i);
+                                }
+                            }
+                        }// for loop end
+
+                        if insert_index.is_none() {
+                            insert_index = Some(self.files.len());
                         }
-                        // when drop reorder
+
+                        // drop line
+                        if self.dragging_idx.is_some() {
+                            if let Some(target) = insert_index {
+                                let y = if target < row_tops.len() { //self.files.len() {
+                                    row_tops[target] //ui.vertical(|_| {}).response.rect.top()
+                                } else {
+                                    ui.min_rect().bottom()
+                                };
+
+                                let full_width = ui.available_width();
+                                let left = ui.min_rect().left();
+                                ui.painter().line_segment(
+                                    [egui::pos2(left, y), egui::pos2(left + full_width, y)],
+                                    egui::Stroke::new(3.0, egui::Color32::LIGHT_BLUE),
+                                );
+                            }
+
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                        }
+
+                        // move algorithm
                         if let Some(drag_i) = self.dragging_idx {
                             if ui.input(|i| i.pointer.any_released()) {
                                 if let Some(target) = insert_index {
@@ -929,34 +922,7 @@ impl eframe::App for BulkRename {
                             }
                         }
 
-                        // dropline
-                        if self.dragging_idx.is_some() {
-                            if let Some(target) = insert_index {
-                                if !item_rects.is_empty() {
-                                    let y = if target < item_rects.len() {
-                                        item_rects[target].top()
-                                    } else {
-                                        item_rects.last().unwrap().bottom()
-                                    };
-                                    let base = if target < item_rects.len() {
-                                        item_rects[target]
-                                    } else {
-                                        *item_rects.last().unwrap()
-                                    };
-
-                                    ui.painter().line_segment(
-                                        [
-                                            egui::pos2(base.left(), y),
-                                            egui::pos2(base.right(), y),
-                                        ],
-                                        egui::Stroke::new(3.0, egui::Color32::LIGHT_BLUE),
-                                    );
-                                }
-                            }
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-                        }
-
-                        // delete
+                        // delete algorithm
                         if self.dragging_idx.is_none() {
                             if let Some(i) = to_delete {
                                 if i < self.files.len() {
