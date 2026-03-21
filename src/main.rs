@@ -5,7 +5,7 @@
 use chrono::{DateTime, Local};
 use directories::ProjectDirs;
 use eframe::{egui, egui::RichText};
-use egui::{ComboBox, DragValue, Layout};
+use egui::{ComboBox, DragValue};//, Layout};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -21,8 +21,15 @@ enum Block {
     Literal(String),
     Number { width: usize, start: i64, step: i64 },
     Date { format: String },
-    Original,
+    Original { mode: OriginalMode, },
     Extension,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum OriginalMode {
+    Keep,
+    RemoveRange { start: i32, end: i32, },
+    RemoveSubstring { pattern: String, case_sensitive: bool, },
 }
 
 #[derive(Clone)]
@@ -58,7 +65,7 @@ enum LoadingPhase {
     LoadingThumbs,
 }
 
-//sort用
+//sort
 #[derive(PartialEq, Copy, Clone)]
 enum SortKey {
     Name,
@@ -72,7 +79,7 @@ enum SortOrder {
     Desc,
 }
 
-struct RenamerApp {
+struct BulkRename {
     files: Vec<FileEntry>,
     selected_idx: Option<usize>,
     blocks: Vec<Block>,
@@ -80,6 +87,7 @@ struct RenamerApp {
     use_mtime_for_date: bool,
     last_actions: Vec<HashMap<PathBuf, PathBuf>>,
     messages: Vec<String>,
+    dragging_idx: Option<usize>,
     // thumbnail cache: key = path → state
     thumbnails: HashMap<String, ThumbnailState>,
     thumb_max_size: (usize, usize),
@@ -96,21 +104,24 @@ struct RenamerApp {
     //sort
     sort_key: Option<SortKey>,
     sort_order: SortOrder,
+    //error
+    show_delete_error: bool,
 }
 
-impl Default for RenamerApp {
+impl Default for BulkRename {
     fn default() -> Self {
         Self {
             files: Vec::new(),
             selected_idx: None,
             blocks: vec![
-                Block::Original,
+                Block::Original { mode: OriginalMode::Keep },
                 Block::Extension,
             ],
             collision: CollisionStrategy::Suffix,
             use_mtime_for_date: true,
             last_actions: Vec::new(),
             messages: Vec::new(),
+            dragging_idx: None,
             thumbnails: HashMap::new(),
             thumb_max_size: (160, 120),
             thumb_tx: None,
@@ -125,11 +136,13 @@ impl Default for RenamerApp {
             //sort
             sort_key: None,
             sort_order: SortOrder::Asc,
+            //error
+            show_delete_error: false,
         }
     }
 }
 
-impl RenamerApp {
+impl BulkRename {
     /// Path to `templates.json` in user config directory.
     fn config_path() -> PathBuf {
         let proj = ProjectDirs::from("jp", "mi3zuk", "BulkReName")
@@ -161,8 +174,60 @@ impl RenamerApp {
         }
     }
 
+    fn process_original(name: &str, mode: &OriginalMode) -> String {
+        match mode {
+            OriginalMode::Keep => name.to_string(),
+
+            OriginalMode::RemoveSubstring { pattern, case_sensitive } => {
+                let mut result = name.to_string();
+
+                for p in pattern.split('/') {
+                    let p = p.trim();
+
+                    // 空要素無視
+                    if p.is_empty() {
+                        continue;
+                    }
+
+                    if *case_sensitive {
+                        result = result.replace(p, "");
+                    } else {
+                        // case-insensitive replace
+                        let mut tmp = String::new();
+                        let mut rest = result.as_str();
+
+                        let p_lower = p.to_lowercase();
+
+                        while let Some(pos) = rest.to_lowercase().find(&p_lower) {
+                            tmp.push_str(&rest[..pos]);
+                            rest = &rest[pos + p.len()..];
+                        }
+                        tmp.push_str(rest);
+                        result = tmp;
+                    }
+                }
+                result
+            }
+
+            OriginalMode::RemoveRange { start, end } => {
+                let chars: Vec<char> = name.chars().collect();
+                let len = chars.len() as i32;
+                let s = if *start < 0 { len + *start } else { *start };
+                let e = if *end < 0 { len + *end + 1 } else { *end };
+                let s = s.clamp(0, len);
+                let e = e.clamp(0, len);
+                if s >= e {
+                    return name.to_string();
+                }
+                chars[..s as usize]
+                    .iter()
+                    .chain(chars[e as usize..].iter())
+                    .collect()
+            }
+        }
+    }
+
     fn sort_files(&mut self, key: SortKey) {
-        // トグル判定
         if self.sort_key == Some(key) {
             self.sort_order = match self.sort_order {
                 SortOrder::Asc => SortOrder::Desc,
@@ -206,8 +271,6 @@ impl RenamerApp {
             }
         }
     }
-
-
 
     fn collect_files_recursively(dir: &Path, out: &mut Vec<PathBuf>) {
         if let Ok(read_dir) = fs::read_dir(dir) {
@@ -292,7 +355,9 @@ impl RenamerApp {
                         .unwrap_or_else(|_| "[INVALID_DATE]".to_string());
                         parts.push(s);
                     }
-                    Block::Original => parts.push(file_name.clone()),
+                    Block::Original { mode } => {
+                        parts.push(Self::process_original(&file_name, mode));
+                    }
                     Block::Extension => {
                         if !ext.is_empty() {
                             parts.push(format!(".{}", ext));
@@ -366,12 +431,41 @@ impl RenamerApp {
         }
     }
 
+    fn split_stem_and_number(stem: &str) -> (String, Option<u32>) {
+        if let Some(idx) = stem.rfind('(') {
+            if stem.ends_with(')') {
+                let num_part = &stem[idx + 1..stem.len() - 1];
+                if let Ok(n) = num_part.parse::<u32>() {
+                    let base = stem[..idx].trim_end().to_string();
+                    return (base, Some(n));
+                }
+            }
+        }
+        (stem.to_string(), None)
+    }
+
+    fn make_numbered_path(path: &PathBuf, n: u32) -> PathBuf {
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let ext = path.extension().and_then(|s| s.to_str());
+        let dir = path.parent().unwrap_or(Path::new("."));
+
+        let (base, _) = Self::split_stem_and_number(stem);
+        let new_stem = format!("{} ({})", base, n);
+
+        if let Some(e) = ext {
+            dir.join(format!("{}.{}", new_stem, e))
+        } else {
+            dir.join(new_stem)
+        }
+    }
+
     fn execute_rename(&mut self) {
         let targets = self.generate_targets();
         if targets.len() != self.files.len() {
             return;
         }
 
+        // final_paths creation
         let mut final_paths = Vec::new();
         for (fe, tname) in self.files.iter().zip(targets.iter()) {
             let mut p = fe.path.clone();
@@ -379,98 +473,100 @@ impl RenamerApp {
             final_paths.push(p);
         }
 
-        // Build robust map orig -> (tmp, final)
-        let mut robust_map = Vec::new();
-        for (i, fe) in self.files.iter().enumerate() {
-            let orig = fe.path.clone();
-            let dir = orig.parent().unwrap_or(Path::new("."));
-            let mut desired = final_paths[i].clone();
-            if desired.exists() {
-                match self.collision {
-                    CollisionStrategy::Overwrite => {}
-                    CollisionStrategy::Skip => {
-                        desired = orig.clone();
-                    }
-                    CollisionStrategy::Suffix => {
-                        let mut n = 1;
-                        loop {
-                            let candidate = append_suffix_before_ext(
-                                &desired,
-                                format!(" ({})", n).as_str(),
-                            );
-                            if !candidate.exists() {
-                                desired = candidate;
-                                break;
-                            }
-                            n += 1;
-                        }
+        // Duplicate detection (between final entries)
+        use std::collections::{HashMap, HashSet};
+
+        let mut used = HashSet::new();
+        let mut resolved_paths = Vec::new();
+
+        for (i, path) in final_paths.iter().enumerate() {
+            let orig = &self.files[i].path;
+
+            match self.collision {
+                CollisionStrategy::Overwrite => {
+                    resolved_paths.push(path.clone());
+                }
+
+                CollisionStrategy::Skip => {
+                    if used.contains(path) {
+                        resolved_paths.push(orig.clone());
+                    } else {
+                        used.insert(path.clone());
+                        resolved_paths.push(path.clone());
                     }
                 }
+
+                CollisionStrategy::Suffix => {
+                    let mut candidate = path.clone();
+                    let mut n = 1;
+
+                    while used.contains(&candidate) {
+                        candidate = Self::make_numbered_path(path, n);
+                        n += 1;
+                    }
+
+                    used.insert(candidate.clone());
+                    resolved_paths.push(candidate);
+                }
             }
-            if desired == orig {
+        }
+
+
+        // orig -> tmp -> final
+        let mut robust_map = Vec::new();
+
+        for (i, fe) in self.files.iter().enumerate() {
+            let orig = fe.path.clone();
+            let desired = resolved_paths[i].clone();
+
+            if orig == desired {
                 continue;
             }
+
+            let dir = orig.parent().unwrap_or(Path::new("."));
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let tmp_name = format!(".tmp-{}-{}", nanos, i);
-            let mut tmp_path = dir.join(&tmp_name);
-            tmp_path.set_extension("tmp");
-            robust_map.push((orig, tmp_path, desired));
+
+            let tmp = dir.join(format!(".tmp-{}-{}.tmp", nanos, i));
+            robust_map.push((orig, tmp, desired));
         }
 
         if robust_map.is_empty() {
-            self.messages
-                .push("No files to rename (all skipped or no files).".into());
+            self.messages.push("No files to rename.".into());
             return;
         }
 
-        // Step A: orig -> tmp
+        // orig → tmp
         let mut temps_created = Vec::new();
-        for (orig, tmp, _) in robust_map.iter() {
+        for (orig, tmp, _) in &robust_map {
             if let Err(e) = fs::rename(orig, tmp) {
-                self.messages
-                    .push(format!("Failed to move {:?} -> {:?}: {}", orig, tmp, e));
+                self.messages.push(format!("Failed: {}", e));
                 for (t, o) in temps_created.iter().rev() {
                     let _ = fs::rename(t, o);
                 }
-                self.messages.push("Performed rollback after failure.".into());
                 return;
             }
             temps_created.push((tmp.clone(), orig.clone()));
         }
 
-        // Step B: tmp -> final
-        let final_mappings: HashMap<PathBuf, PathBuf> = HashMap::new(); // explicit types
-        for (_orig, tmp, final_path) in robust_map.iter() {
+        // tmp → final
+        for (_orig, tmp, final_path) in &robust_map {
             if let Err(e) = fs::rename(tmp, final_path) {
-                self.messages.push(format!(
-                    "Failed to move temp {:?} -> final {:?}: {}",
-                    tmp, final_path, e
-                ));
-                for (t, o) in &temps_created {
-                    if t.exists() {
-                        let _ = fs::rename(t, o);
-                    }
-                }
-                for (o, f) in &final_mappings {
-                    if f.exists() {
-                        let _ = fs::rename(f, o);
-                    }
-                }
-                self.messages.push("Attempted rollback after partial failure.".into());
+                self.messages.push(format!("Failed final rename: {}", e));
                 return;
             }
         }
 
-        // Build undo map orig -> final
-        let mut undo_map: HashMap<PathBuf, PathBuf> = HashMap::new();
+        // undo
+        let mut undo_map = HashMap::new();
         for (orig, _tmp, final_path) in robust_map {
             undo_map.insert(orig, final_path);
         }
         self.last_actions.push(undo_map);
-        self.messages.push("Rename completed successfully.".into());
+
+        self.messages.push("Rename completed.".into());
     }
 
     fn undo(&mut self) {
@@ -497,19 +593,7 @@ impl RenamerApp {
     }
 }
 
-fn append_suffix_before_ext(p: &PathBuf, suffix: &str) -> PathBuf {
-    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-    let ext = p.extension().and_then(|s| s.to_str());
-    let dir = p.parent().unwrap_or(Path::new("."));
-    let new_stem = format!("{}{}", stem, suffix);
-    if let Some(e) = ext {
-        dir.join(format!("{}.{}", new_stem, e))
-    } else {
-        dir.join(new_stem)
-    }
-}
-
-impl eframe::App for RenamerApp {
+impl eframe::App for BulkRename {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Process thumbnail loading results
         if let Some(rx) = &self.thumb_rx {
@@ -692,94 +776,197 @@ impl eframe::App for RenamerApp {
                 let left = &mut cols[0];
                 left.label(RichText::new("Files (select then move)").strong());
                 left.checkbox(&mut self.show_thumbnails, "show thumbnail");
+
                 egui::ScrollArea::vertical()
                     .max_height(800.0)
                     .auto_shrink([false, false])
                     .id_source("file_list")
                     .show(left, |ui| {
                         let mut to_delete = None;
-
-                        for i in 0..self.files.len() {
-                            let full = self.files[i]
-                                .path
-                                .file_name()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("")
-                                .to_string();
-                            let disp = {
-                                let chars: Vec<char> = full.chars().collect();
-                                if chars.len() > 20 {
-                                    let first_10: String = chars[..10].iter().collect();
-                                    let last_9: String = chars[chars.len().saturating_sub(9)..].iter().collect();
-                                    format!("{}…{}", first_10, last_9)
-                                } else {
-                                    full.clone()
+                        let pointer_y = ui.input(|i| i.pointer.hover_pos().map(|p| p.y));
+                        // rect
+                        let mut item_rects = Vec::new();
+                        for _ in 0..self.files.len() {
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), 60.0),
+                                egui::Sense::click_and_drag(),
+                            );
+                            item_rects.push(rect);
+                        }
+                        // Insertion position calculation
+                        let mut insert_index = None;
+                        if let Some(py) = pointer_y {
+                            for (i, rect) in item_rects.iter().enumerate() {
+                                if py < rect.center().y {
+                                    insert_index = Some(i);
+                                    break;
                                 }
-                            };
-                            ui.horizontal(|ui| {
-                                ui.with_layout(Layout::left_to_right(egui::Align::TOP), |ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.vertical(|ui| {
-                                            if ui.small_button("▲").clicked() {
-                                                self.selected_idx = Some(i);
-                                                self.move_up();
-                                            }
-                                            if ui.small_button("▼").clicked() {
-                                                self.selected_idx = Some(i);
-                                                self.move_down();
-                                            }
-                                        });
+                            }
+                            if insert_index.is_none() {
+                                insert_index = Some(self.files.len());
+                            }
+                        }
+                        // drow
+                        for i in 0..self.files.len() {
+                            let rect = item_rects[i];
+                            let id = ui.id().with(i);
+                            let resp = ui.interact(rect, id, egui::Sense::click_and_drag());
 
-                                        // thumbnail
-                                        if self.show_thumbnails {
-                                            let path_buf = self.files[i].path.clone();
-                                            let key = path_buf.to_string_lossy().to_string();
-                                            if !self.thumbnails.contains_key(&key) {
-                                                self.ensure_thumbnail(ctx, &path_buf);
-                                            }
-                                            match self.thumbnails.get(&key) {
-                                                Some(ThumbnailState::Loaded(tex, orig_size)) => {
-                                                    let max_w = self.thumb_max_size.0 as f32;
-                                                    let max_h = self.thumb_max_size.1 as f32;
-                                                    let scale = (max_w / orig_size.x)
-                                                        .min(max_h / orig_size.y)
-                                                        .min(1.0);
-                                                    let size = *orig_size * scale;
-                                                    ui.image((tex.id(), size));
-                                                }
-                                                Some(ThumbnailState::Loading) => {
-                                                    ui.spinner();
-                                                }
-                                                _ => {}
-                                            }   
+                            // start drag
+                            if resp.drag_started() {
+                                self.dragging_idx = Some(i);
+                                self.selected_idx = Some(i);
+                            }
+                            if resp.clicked() {
+                                self.selected_idx = Some(i);
+                            }
+
+                            // item background
+                            if Some(i) == self.dragging_idx {
+                                ui.painter().rect_filled(rect, 6.0, egui::Color32::DARK_GRAY);
+                            } else if Some(i) == self.selected_idx {
+                                ui.painter().rect_filled(rect, 6.0, egui::Color32::from_rgb(180, 180, 180));
+                            }
+                            if ui.input(|i| i.pointer.any_pressed()) && self.dragging_idx.is_none() {
+                                self.selected_idx = None;
+                            }
+
+                            // contents
+                            ui.allocate_ui_at_rect(rect, |ui| {
+                                ui.horizontal(|ui| {
+                                    // delete buttom
+                                    //ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                                        let del_btn = egui::Button::new("×")
+                                            .fill(egui::Color32::from_rgb(240, 120, 120));
+
+                                        if ui.add(del_btn).clicked() {
+                                            to_delete = Some(i);
+                                        }
+                                    //});
+                                    ui.separator();
+                                    // ▲▼
+                                    ui.vertical(|ui| {
+                                        if ui.small_button("▲").clicked() {
+                                            self.selected_idx = Some(i);
+                                            self.move_up();
+                                        }
+                                        if ui.small_button("▼").clicked() {
+                                            self.selected_idx = Some(i);
+                                            self.move_down();
+                                        }
+                                    });
+
+                                    // サムネ
+                                    if self.show_thumbnails {
+                                        let path_buf = self.files[i].path.clone();
+                                        let key = path_buf.to_string_lossy().to_string();
+
+                                        if !self.thumbnails.contains_key(&key) {
+                                            self.ensure_thumbnail(ui.ctx(), &path_buf);
                                         }
 
-                                        let selected = Some(i) == self.selected_idx;
-                                        let resp = ui.selectable_label(selected, disp);
-                                        resp.on_hover_text(full);
-                                    });
-                                });
-
-                                ui.with_layout(Layout::right_to_left(egui::Align::TOP), |ui| {
-                                    ui.add_space(10.0);
-                                    let del_btn = egui::Button::new("Del")
-                                        .fill(egui::Color32::from_rgb(240, 150, 150));
-
-                                    if ui.add(del_btn).clicked() {
-                                        to_delete = Some(i);
-                                        self.selected_idx = Some(i);
+                                        match self.thumbnails.get(&key) {
+                                            Some(ThumbnailState::Loaded(tex, orig_size)) => {
+                                                let max_w = self.thumb_max_size.0 as f32;
+                                                let max_h = self.thumb_max_size.1 as f32;
+                                                let scale = (max_w / orig_size.x)
+                                                    .min(max_h / orig_size.y)
+                                                    .min(1.0);
+                                                let size = *orig_size * scale;
+                                                ui.image((tex.id(), size));
+                                            }
+                                            Some(ThumbnailState::Loading) => {
+                                                ui.spinner();
+                                            }
+                                            _ => {}
+                                        }
                                     }
+
+                                    // file name
+                                    let full = self.files[i]
+                                        .path
+                                        .file_name()
+                                        .and_then(|s| s.to_str())
+                                        .unwrap_or("")
+                                        .to_string();
+
+                                    let disp = {
+                                        let chars: Vec<char> = full.chars().collect();
+                                        if chars.len() > 20 {
+                                            let first: String = chars[..10].iter().collect();
+                                            let last: String = chars[chars.len() - 9..].iter().collect();
+                                            format!("{}…{}", first, last)
+                                        } else {
+                                            full.clone()
+                                        }
+                                    };
+
+                                    ui.label(disp).on_hover_text(full);
+
                                 });
                             });
-
-                            ui.separator();
+                            // sparator
+                            ui.painter().line_segment(
+                                [
+                                    egui::pos2(rect.left(), rect.bottom()),
+                                    egui::pos2(rect.right(), rect.bottom()),
+                                ],
+                                egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
+                            );
                         }
-                        if let Some(i) = to_delete {
-                            self.selected_idx = Some(i);
-                            self.remove_selected();
+                        // when drop reorder
+                        if let Some(drag_i) = self.dragging_idx {
+                            if ui.input(|i| i.pointer.any_released()) {
+                                if let Some(target) = insert_index {
+                                    let item = self.files.remove(drag_i);
+                                    let mut target = target;
+                                    if drag_i < target { target -= 1; }
+                                    let target = target.min(self.files.len());
+                                    self.files.insert(target, item);
+                                    self.selected_idx = Some(target);
+                                }
+                                self.dragging_idx = None;
+                            }
+                        }
+
+                        // dropline
+                        if self.dragging_idx.is_some() {
+                            if let Some(target) = insert_index {
+                                if !item_rects.is_empty() {
+                                    let y = if target < item_rects.len() {
+                                        item_rects[target].top()
+                                    } else {
+                                        item_rects.last().unwrap().bottom()
+                                    };
+                                    let base = if target < item_rects.len() {
+                                        item_rects[target]
+                                    } else {
+                                        *item_rects.last().unwrap()
+                                    };
+
+                                    ui.painter().line_segment(
+                                        [
+                                            egui::pos2(base.left(), y),
+                                            egui::pos2(base.right(), y),
+                                        ],
+                                        egui::Stroke::new(3.0, egui::Color32::LIGHT_BLUE),
+                                    );
+                                }
+                            }
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                        }
+
+                        // delete
+                        if self.dragging_idx.is_none() {
+                            if let Some(i) = to_delete {
+                                if i < self.files.len() {
+                                    self.selected_idx = Some(i);
+                                    self.remove_selected();
+                                }
+                            }
                         }
                     });
-
+                
 
                 // Right panel: template, preview, persistence
                 let right = &mut cols[1];
@@ -792,6 +979,16 @@ impl eframe::App for RenamerApp {
                     let mut new_blk = blk.clone();
                     let mut action: Option<&str> = None;
                     right.horizontal(|ui| {
+                        let del_block = egui::Button::new("×")
+                            .fill(egui::Color32::from_rgb(240, 150, 150));
+                        if ui.add(del_block).clicked() {
+                            if self.blocks.len() <= 1 {
+                                self.show_delete_error = true;
+                            } else {
+                                action = Some("del");
+                            }
+                        }
+                        ui.separator();
                         if ui.small_button("▲").clicked() && idx > 0 {
                             action = Some("up");
                         }
@@ -817,15 +1014,73 @@ impl eframe::App for RenamerApp {
                                 ui.text_edit_singleline(format);
                                 ui.label("(strftime)");
                             }
-                            Block::Original => {
-                                ui.label("<Orig. Name>");
+                            Block::Original { mode } => {
+                                ui.label("<Orig>");
+
+                                egui::ComboBox::from_id_source(format!("orig_mode_{}", idx))
+                                    .selected_text(match mode {
+                                        OriginalMode::Keep => "Keep",
+                                        OriginalMode::RemoveRange { .. } => "Del Range",
+                                        OriginalMode::RemoveSubstring { .. } => "Del Substr.",
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        if ui.selectable_label(matches!(mode, OriginalMode::Keep), "Keep").clicked() {
+                                            *mode = OriginalMode::Keep;
+                                        }
+                                        if ui.selectable_label(matches!(mode, OriginalMode::RemoveRange { .. }), "Range").clicked() {
+                                            *mode = OriginalMode::RemoveRange { start: 0, end: 1 };
+                                        }
+                                        if ui.selectable_label(matches!(mode, OriginalMode::RemoveSubstring { .. }), "Substring").clicked() {
+                                            *mode = OriginalMode::RemoveSubstring { pattern: "".into(), case_sensitive: true, };
+                                        }
+                                    });
+
+                                match mode {
+                                    OriginalMode::RemoveRange { start, end } => {
+                                        ui.label("range:");
+                                        ui.add(DragValue::new(start));
+                                        ui.label("～");
+                                        ui.add(DragValue::new(end));
+                                    }
+                                    OriginalMode::RemoveSubstring { pattern, case_sensitive } => {
+                                        ui.vertical(|ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.toggle_value(case_sensitive, "Aa")
+                                                    .on_hover_text("Case sensitive");
+                                                ui.label("pattern:");
+                                                ui.text_edit_singleline(pattern);
+                                            });
+                                        });
+                                    }
+                                    _ => {}
+                                }
                             }
                             Block::Extension => {
                                 ui.label("<Extension>");
                             }
                         }
-                        if ui.small_button("Del").clicked() {
-                            action = Some("del");
+                        if self.show_delete_error {
+                            egui::Window::new("ERROR")
+                                .collapsible(false)
+                                .resizable(false)
+                                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                                .fixed_size(egui::vec2(180.0, 90.0))
+                                .show(ui.ctx(), |ui| {
+                                    ui.vertical_centered(|ui| {
+                                        ui.set_width(160.0);
+
+                                        ui.add(
+                                            egui::Label::new("need at least 1 block")
+                                                .wrap(true)
+                                        );
+
+                                        ui.add_space(8.0);
+
+                                        if ui.button("OK").clicked() {
+                                            self.show_delete_error = false;
+                                        }
+                                    });
+                                });
                         }
                     });
                     if let Some(act) = action {
@@ -868,7 +1123,7 @@ impl eframe::App for RenamerApp {
                         });
                     }
                     if ui.button("Add Original").clicked() {
-                        self.blocks.push(Block::Original);
+                        self.blocks.push(Block::Original { mode: OriginalMode::Keep } );
                     }
                     if ui.button("Add Extension").clicked() {
                         self.blocks.push(Block::Extension);
@@ -882,7 +1137,7 @@ impl eframe::App for RenamerApp {
                     ui.radio_value(&mut self.collision, CollisionStrategy::Skip, "Skip");
                     ui.radio_value(&mut self.collision, CollisionStrategy::Suffix, "Suffix (1)");
                 });
-                right.checkbox(&mut self.use_mtime_for_date, "Use file mtime for date");
+                //right.checkbox(&mut self.use_mtime_for_date, "Use file mtime for date");
 
                 right.separator();
                 right.label(RichText::new("Preview").strong());
@@ -1041,7 +1296,7 @@ fn main() {
                 .insert(0, "noto_jp".to_owned());
             cc.egui_ctx.set_fonts(fonts);
 
-            let mut app = RenamerApp::default();
+            let mut app = BulkRename::default();
             app.load_templates();
             Box::new(app)
         }),
